@@ -1,0 +1,164 @@
+name: Build dedicated FFmpeg
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ffmpeg-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: ubuntu-22.04
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install macOS build tools and independent test decoder
+        if: runner.os == 'macOS'
+        run: brew install pkg-config ffmpeg
+      - name: Install Windows cross compiler
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential gcc-mingw-w64-x86-64 pkg-config python3
+      - name: Build from vendored sources
+        shell: bash
+        run: |
+          mkdir -p build/logs
+          set -o pipefail
+          bash scripts/build.sh '${{ matrix.target }}' 2>&1 | tee build/logs/build.log
+      - name: Test real exports on macOS
+        if: runner.os == 'macOS'
+        run: python3 scripts/smoke.py 'dist/${{ matrix.target }}/bin/ffmpeg' --report build/smoke.json
+      - name: Package
+        run: python3 scripts/package.py archive '${{ matrix.target }}'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.target }}
+          path: |
+            dist/${{ matrix.target }}/
+            dist/ffmpeg-aa-*-${{ matrix.target }}.*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostics-${{ matrix.target }}
+          path: |
+            build/logs/
+            build/smoke.json
+            build/${{ matrix.target }}/ffmpeg/ffbuild/config.log
+
+  test-windows:
+    needs: build
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-x86_64-pc-windows-msvc
+          path: dist
+      - name: Install independent test decoder
+        run: choco install ffmpeg --yes --no-progress
+      - name: Test Windows executable natively
+        run: python scripts/smoke.py dist/x86_64-pc-windows-msvc/bin/ffmpeg.exe --report build/smoke-windows.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-windows-runtime
+          path: build/smoke-windows.json
+
+  universal:
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-aarch64-apple-darwin
+          path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          name: build-x86_64-apple-darwin
+          path: dist
+      - name: Merge, sign, and audit both slices
+        run: |
+          chmod +x dist/*/bin/ffmpeg
+          python3 scripts/package.py universal
+      - name: Test universal executable
+        run: |
+          brew install ffmpeg
+          python3 scripts/smoke.py dist/universal-apple-darwin/bin/ffmpeg --report build/smoke-universal.json
+          codesign --verify --strict dist/universal-apple-darwin/bin/ffmpeg
+          python3 scripts/package.py archive universal-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-universal-apple-darwin
+          path: |
+            dist/ffmpeg-aa-*-universal-apple-darwin.tar.gz
+            dist/ffmpeg-aa-*-universal-apple-darwin.tar.gz.sha256
+          if-no-files-found: error
+
+  source:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify release version
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        run: test "$GITHUB_REF_NAME" = "v$(cat VERSION)"
+      - name: Check scripts and package complete corresponding source
+        run: |
+          bash -n scripts/build.sh scripts/ffmpeg-options.sh
+          PYTHONPYCACHEPREFIX=build/pycache python3 -m py_compile scripts/*.py
+          python3 scripts/package.py source
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-source
+          path: |
+            dist/ffmpeg-aa-*-source.tar.xz
+            dist/ffmpeg-aa-*-source.tar.xz.sha256
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build, test-windows, universal, source]
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          merge-multiple: true
+          path: dist
+      - name: Create draft release after all platform tests pass
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" --verify-tag --draft \
+            --title "Asset Archive FFmpeg $GITHUB_REF_NAME" --notes-file docs/release-notes.md \
+            dist/*.zip dist/*.tar.gz dist/*.tar.xz dist/*.sha256
